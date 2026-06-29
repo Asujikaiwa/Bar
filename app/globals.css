@@ -8,3 +8,17 @@ body {
   color: #fff;
   -webkit-tap-highlight-color: transparent;
 }
+
+/* ---- Splash / loading animations ---- */
+@keyframes splashIn {
+  from { opacity: 0; transform: translateY(12px) scale(0.92); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes clink {
+  0%, 100% { transform: rotate(-8deg) scale(1); }
+  50%      { transform: rotate(8deg) scale(1.12); }
+}
+@keyframes slide {
+  0%   { transform: translateX(-120%); }
+  100% { transform: translateX(260%); }
+}

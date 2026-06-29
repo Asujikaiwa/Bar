@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { supabase, avatarUrl, type Patron } from "@/lib/supabase/client";
+import { supabase, avatarUrl, DRINKS, type Patron } from "@/lib/supabase/client";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 
 const GENDER_COLOR: Record<string, string> = {
@@ -18,6 +18,7 @@ export default function RadarLobby({ me, barId }: { me: Patron; barId: string })
   const [cheered, setCheered] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<string | null>(null);
   const [match, setMatch] = useState<{ matchId: string; nickname: string } | null>(null);
+  const [drinkFor, setDrinkFor] = useState<Patron | null>(null);
   const channelRef = useRef<RealtimeChannel | null>(null);
 
   // ---- Presence: who's currently in the bar -------------------------------
@@ -117,6 +118,23 @@ export default function RadarLobby({ me, barId }: { me: Patron; barId: string })
     setTimeout(() => setToast(null), 3500);
   }
 
+  async function sendDrink(target: Patron, drink: string) {
+    setDrinkFor(null);
+    const { error } = await supabase.from("drink_orders").insert({
+      bar_id: barId,
+      from_nick: me.nickname,
+      to_nick: target.nickname,
+      to_table: target.table_no ?? null,
+      drink,
+    });
+    setToast(
+      error
+        ? "ส่งเครื่องดื่มไม่สำเร็จ ลองใหม่"
+        : `ส่ง ${drink} ให้ ${target.nickname} แล้ว! พนักงานกำลังนำไปเสิร์ฟ 🍹`
+    );
+    setTimeout(() => setToast(null), 4000);
+  }
+
   return (
     <main className="min-h-dvh bg-black text-white relative overflow-hidden">
       <div className="pointer-events-none absolute top-1/3 left-1/2 -translate-x-1/2 h-96 w-96 rounded-full bg-fuchsia-700/20 blur-3xl" />
@@ -152,7 +170,7 @@ export default function RadarLobby({ me, barId }: { me: Patron; barId: string })
       {view === "radar" ? (
         <RadarView patrons={patrons} me={me} cheered={cheered} onCheers={sendCheers} />
       ) : (
-        <ListView patrons={patrons} cheered={cheered} onCheers={sendCheers} />
+        <ListView patrons={patrons} cheered={cheered} onCheers={sendCheers} onDrink={setDrinkFor} />
       )}
 
       {toast && !match && (
@@ -182,6 +200,38 @@ export default function RadarLobby({ me, barId }: { me: Patron; barId: string })
           <button onClick={() => setMatch(null)} className="mt-3 text-sm text-white/50">
             Keep mingling
           </button>
+        </div>
+      )}
+
+      {/* Send-a-drink picker */}
+      {drinkFor && (
+        <div
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur flex items-end sm:items-center justify-center"
+          onClick={() => setDrinkFor(null)}
+        >
+          <div
+            className="w-full max-w-sm bg-zinc-900 border border-white/10 rounded-t-3xl sm:rounded-3xl p-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <p className="text-center font-bold mb-1">ส่งเครื่องดื่มให้ {drinkFor.nickname} 🍹</p>
+            <p className="text-center text-xs text-white/40 mb-4">
+              {drinkFor.table_no ? `พนักงานจะนำไปเสิร์ฟที่โต๊ะ ${drinkFor.table_no}` : "พนักงานจะช่วยตามหาให้"}
+            </p>
+            <div className="grid grid-cols-2 gap-2">
+              {DRINKS.map((d) => (
+                <button
+                  key={d}
+                  onClick={() => sendDrink(drinkFor, d)}
+                  className="rounded-xl py-3 bg-white/5 border border-white/10 hover:border-cyan-400/60 active:scale-95 transition"
+                >
+                  {d}
+                </button>
+              ))}
+            </div>
+            <button onClick={() => setDrinkFor(null)} className="w-full mt-4 text-sm text-white/50">
+              ยกเลิก
+            </button>
+          </div>
         </div>
       )}
     </main>
@@ -250,30 +300,39 @@ function RadarView({
 }
 
 function ListView({
-  patrons, cheered, onCheers,
+  patrons, cheered, onCheers, onDrink,
 }: {
-  patrons: Patron[]; cheered: Set<string>; onCheers: (p: Patron) => void;
+  patrons: Patron[]; cheered: Set<string>; onCheers: (p: Patron) => void; onDrink: (p: Patron) => void;
 }) {
   return (
     <ul className="px-4 mt-2 space-y-2 pb-24">
       {patrons.map((p) => (
         <li
           key={p.user_id}
-          className="flex items-center gap-3 bg-white/5 border border-white/10 rounded-2xl p-3"
+          className="flex items-center gap-2 bg-white/5 border border-white/10 rounded-2xl p-3"
         >
           <img src={avatarUrl(p.avatar_seed)} alt="" className={`h-12 w-12 rounded-full ring-2 ${GENDER_COLOR[p.gender]}`} />
           <div className="flex-1 min-w-0">
             <p className="font-semibold truncate">{p.nickname}</p>
-            <p className="text-xs text-white/40 capitalize">{p.gender}</p>
+            <p className="text-xs text-white/40 capitalize">
+              {p.gender}{p.table_no ? ` · โต๊ะ ${p.table_no}` : ""}
+            </p>
           </div>
+          <button
+            onClick={() => onDrink(p)}
+            className="px-3 py-2 rounded-full text-sm bg-white/10 active:scale-95 transition"
+            aria-label="ส่งเครื่องดื่ม"
+          >
+            🍹
+          </button>
           <button
             onClick={() => onCheers(p)}
             disabled={cheered.has(p.user_id)}
-            className="px-4 py-2 rounded-full text-sm font-bold text-black
+            className="px-3 py-2 rounded-full text-sm font-bold text-black
                        bg-gradient-to-r from-cyan-400 to-fuchsia-400
                        disabled:opacity-40 disabled:grayscale active:scale-95 transition"
           >
-            {cheered.has(p.user_id) ? "Sent" : "Cheers 🍻"}
+            {cheered.has(p.user_id) ? "Sent" : "🍻"}
           </button>
         </li>
       ))}

@@ -8,6 +8,7 @@ import type { Patron } from "@/lib/supabase/client";
 export default function LobbyPage() {
   const router = useRouter();
   const [me, setMe] = useState<Patron | null>(null);
+  const [barId, setBarId] = useState("demo");
 
   useEffect(() => {
     const raw = sessionStorage.getItem("patron");
@@ -16,9 +17,16 @@ export default function LobbyPage() {
       return;
     }
     const u = JSON.parse(raw);
-    setMe({ user_id: u.id, nickname: u.nickname, gender: u.gender, avatar_seed: u.avatar_seed });
+    setBarId(sessionStorage.getItem("barId") || "demo");
+    setMe({
+      user_id: u.id,
+      nickname: u.nickname,
+      gender: u.gender,
+      avatar_seed: u.avatar_seed,
+      table_no: u.table_no ?? null,
+    });
   }, [router]);
 
   if (!me) return null;
-  return <RadarLobby me={me} barId="demo" />;
+  return <RadarLobby me={me} barId={barId} />;
 }

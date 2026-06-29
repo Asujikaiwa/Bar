@@ -4,6 +4,7 @@ import { useState, useTransition } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { joinBar } from "./actions";
 import { GENDERS, avatarUrl, type Gender } from "@/lib/supabase/client";
+import Splash from "@/components/Splash";
 
 // Fun random nickname so users can enter with a single tap (still editable).
 const ADJ = ["Neon", "Midnight", "Velvet", "Electric", "Golden", "Crimson", "Lunar", "Disco", "Smoky", "Wild"];
@@ -19,7 +20,9 @@ export default function OnboardingPage() {
   const params = useSearchParams();
   const barId = params.get("b") ?? "demo";
   const token = params.get("d") ?? "";
+  const table = params.get("table") ?? "";
 
+  const [booted, setBooted] = useState(false);
   const [nickname, setNickname] = useState(randomNickname);
   const [gender, setGender] = useState<Gender | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -43,15 +46,18 @@ export default function OnboardingPage() {
     if (!gender) return setError("Pick how you'd like to show up.");
     startTransition(async () => {
       const coords = await getCoords();
-      const res = await joinBar({ barId, token, nickname, gender, coords });
+      const res = await joinBar({ barId, token, nickname, gender, coords, table });
       if (!res.ok) return setError(res.error);
       sessionStorage.setItem("patron", JSON.stringify(res.user));
+      sessionStorage.setItem("barId", barId);
       router.push("/lobby");
     });
   }
 
   return (
-    <main className="min-h-dvh bg-black text-white flex flex-col items-center justify-center px-6 py-10 overflow-hidden relative">
+    <>
+      {!booted && <Splash onDone={() => setBooted(true)} />}
+      <main className="min-h-dvh bg-black text-white flex flex-col items-center justify-center px-6 py-10 overflow-hidden relative">
       {/* ambient neon glow */}
       <div className="pointer-events-none absolute -top-24 -left-24 h-72 w-72 rounded-full bg-fuchsia-600/30 blur-3xl" />
       <div className="pointer-events-none absolute -bottom-24 -right-24 h-72 w-72 rounded-full bg-cyan-500/30 blur-3xl" />
@@ -144,6 +150,7 @@ export default function OnboardingPage() {
           </p>
         </form>
       </div>
-    </main>
+      </main>
+    </>
   );
 }

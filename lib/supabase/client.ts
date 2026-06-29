@@ -27,4 +27,15 @@ export type Patron = {
   nickname: string;
   gender: Gender;
   avatar_seed: string;
+  table_no?: string | null;
 };
+
+// Drink menu for the "send a drink 🍹" feature
+export const DRINKS = [
+  "เบียร์ 🍺",
+  "ค็อกเทล 🍸",
+  "ช็อต 🥃",
+  "ไวน์ 🍷",
+  "แชมเปญ 🥂",
+  "น้ำผลไม้ 🧃",
+] as const;

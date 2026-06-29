@@ -25,26 +25,18 @@ function getServerClient() {
   );
 }
 
-// ---- Optional geofence -----------------------------------------------------
-function withinBar(lat: number, lng: number, barId: string) {
-  const bar = BARS[barId];
-  if (!bar) return false;
+// ---- Geofence (distance between two GPS points, meters) --------------------
+function distanceMeters(lat1: number, lng1: number, lat2: number, lng2: number) {
   const R = 6371e3;
-  const dLat = ((lat - bar.lat) * Math.PI) / 180;
-  const dLng = ((lng - bar.lng) * Math.PI) / 180;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
   const a =
     Math.sin(dLat / 2) ** 2 +
-    Math.cos((bar.lat * Math.PI) / 180) *
-      Math.cos((lat * Math.PI) / 180) *
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
       Math.sin(dLng / 2) ** 2;
-  const dist = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return dist <= bar.radiusMeters;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
-
-const BARS: Record<string, { lat: number; lng: number; radiusMeters: number }> = {
-  // configure your venues here
-  demo: { lat: 13.7563, lng: 100.5018, radiusMeters: 120 },
-};
 
 type JoinInput = {
   barId: string;
@@ -52,17 +44,39 @@ type JoinInput = {
   nickname: string;
   gender: "male" | "female" | "lgbtq";
   coords?: { lat: number; lng: number } | null;
+  table?: string | null;
 };
 
 export async function joinBar(input: JoinInput) {
-  const { barId, token, nickname, gender, coords } = input;
+  const { barId, token, nickname, gender, coords, table } = input;
 
   // 1. Validate access (dynamic QR + optional geofence)
   if (token !== dailyToken(barId)) {
     return { ok: false as const, error: "This QR code has expired. Please rescan the code on your table." };
   }
-  if (coords && !withinBar(coords.lat, coords.lng, barId)) {
-    return { ok: false as const, error: "You must be inside the bar to join." };
+
+  // 3. Server-side Supabase client bound to the cookie session
+  const supabase = getServerClient();
+
+  // Look up this bar (geofence + billing status), managed via /admin.
+  const { data: bar } = await supabase
+    .from("bars")
+    .select("lat, lng, radius_meters, active, expires_at")
+    .eq("id", barId)
+    .single();
+
+  // Billing gate: bar must exist, be active, and not expired.
+  if (!bar || bar.active === false || (bar.expires_at && new Date(bar.expires_at) < new Date())) {
+    return { ok: false as const, error: "This bar is not active right now." };
+  }
+
+  // Geofence is enforced only in production so local testing isn't blocked.
+  const enforceGeofence = process.env.NODE_ENV === "production";
+  if (enforceGeofence && coords) {
+    const dist = distanceMeters(coords.lat, coords.lng, bar.lat, bar.lng);
+    if (dist > bar.radius_meters) {
+      return { ok: false as const, error: "You must be inside the bar to join." };
+    }
   }
 
   // 2. Validate nickname
@@ -73,9 +87,6 @@ export async function joinBar(input: JoinInput) {
   if (!["male", "female", "lgbtq"].includes(gender)) {
     return { ok: false as const, error: "Please select a gender." };
   }
-
-  // 3. Server-side Supabase client bound to the cookie session
-  const supabase = getServerClient();
 
   // 4. Anonymous sign-in → throwaway auth.uid(), no email/password
   const { data: auth, error: authErr } = await supabase.auth.signInAnonymously();
@@ -93,8 +104,9 @@ export async function joinBar(input: JoinInput) {
       nickname: nick,
       gender,
       avatar_seed,
+      table_no: table?.toString().slice(0, 10) || null,
     })
-    .select("id, nickname, gender, avatar_seed")
+    .select("id, nickname, gender, avatar_seed, table_no")
     .single();
 
   if (insErr || !user) {
