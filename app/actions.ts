@@ -1,14 +1,18 @@
 "use server";
 
-import { createServerClient } from "@supabase/ssr";
+import { createServerClient, type CookieOptions } from "@supabase/ssr";
 import { cookies } from "next/headers";
 import crypto from "crypto";
 import { dailyToken } from "@/lib/qrToken";
-import { maskProfanity } from "@/lib/profanity";
+import { maskProfanity, containsProfanity } from "@/lib/profanity";
+import { rateLimit, clientKey } from "@/lib/rateLimit";
+import { serviceClient } from "@/lib/supabase/service";
+import { DRINKS } from "@/lib/constants";
 
-// Access control note: the QR encodes ?b=<barId>&d=<dailyToken>. The token is
-// produced by lib/qrToken.ts and validated here on the SERVER so it can't be
-// bypassed from the client.
+// Access control note: the QR encodes ?b=<barId>&d=<dailyToken>. The token only
+// proves the link is from today — /t/<bar> hands it to whoever scans, which is
+// what makes a printed QR reusable. The gate that actually proves the customer
+// is in the venue is the geofence below.
 
 // Server-side Supabase client bound to the current cookie session.
 function getServerClient() {
@@ -19,7 +23,8 @@ function getServerClient() {
     {
       cookies: {
         getAll: () => cookieStore.getAll(),
-        setAll: (all) => all.forEach((c) => cookieStore.set(c.name, c.value, c.options)),
+        setAll: (all: { name: string; value: string; options: CookieOptions }[]) =>
+          all.forEach((c) => cookieStore.set(c.name, c.value, c.options)),
       },
     }
   );
@@ -50,10 +55,27 @@ type JoinInput = {
 export async function joinBar(input: JoinInput) {
   const { barId, token, nickname, gender, coords, table } = input;
 
-  // 1. Validate access (dynamic QR + optional geofence)
+  if (!rateLimit(clientKey("join"), 10, 60_000)) {
+    return { ok: false as const, error: "Too many attempts. Please wait a minute." };
+  }
+
+  // 1. Validate access (dynamic QR + geofence)
   if (token !== dailyToken(barId)) {
     return { ok: false as const, error: "This QR code has expired. Please rescan the code on your table." };
   }
+
+  // 2. Validate nickname + gender before touching the database
+  const nick = nickname.trim();
+  if (nick.length < 2 || nick.length > 20) {
+    return { ok: false as const, error: "Nickname must be 2–20 characters." };
+  }
+  if (containsProfanity(nick)) {
+    return { ok: false as const, error: "Please pick a different nickname." };
+  }
+  if (!["male", "female", "lgbtq"].includes(gender)) {
+    return { ok: false as const, error: "Please select a gender." };
+  }
+  const tableNo = table?.toString().slice(0, 10) || null;
 
   // 3. Server-side Supabase client bound to the cookie session
   const supabase = getServerClient();
@@ -71,30 +93,56 @@ export async function joinBar(input: JoinInput) {
   }
 
   // Geofence is enforced only in production so local testing isn't blocked.
-  const enforceGeofence = process.env.NODE_ENV === "production";
-  if (enforceGeofence && coords) {
+  // Missing coordinates are a REFUSAL, not a free pass — denying the location
+  // prompt used to skip the check entirely.
+  if (process.env.NODE_ENV === "production") {
+    if (!coords) {
+      return {
+        ok: false as const,
+        error: "Please allow location access — it's how we check you're in the bar.",
+      };
+    }
     const dist = distanceMeters(coords.lat, coords.lng, bar.lat, bar.lng);
     if (dist > bar.radius_meters) {
       return { ok: false as const, error: "You must be inside the bar to join." };
     }
   }
 
-  // 2. Validate nickname
-  const nick = nickname.trim();
-  if (nick.length < 2 || nick.length > 20) {
-    return { ok: false as const, error: "Nickname must be 2–20 characters." };
-  }
-  if (!["male", "female", "lgbtq"].includes(gender)) {
-    return { ok: false as const, error: "Please select a gender." };
+  // 4. Reuse the existing anonymous session if there is one. Signing in again on
+  // every scan created a brand-new auth user (and a ghost on the radar) each
+  // time — and every one of them counts towards Supabase MAU.
+  const { data: session } = await supabase.auth.getUser();
+  if (session.user) {
+    // Looked up with the service role on purpose: the users RLS policy hides
+    // banned rows, so an anon read here would silently miss the ban and hand
+    // the person a brand-new identity.
+    const { data: existing } = await serviceClient()
+      .from("users")
+      .select("id, nickname, gender, avatar_seed, table_no, bar_id, is_banned")
+      .eq("auth_uid", session.user.id)
+      .maybeSingle();
+
+    if (existing && existing.bar_id === barId) {
+      if (existing.is_banned) {
+        return { ok: false as const, error: "This account can no longer join." };
+      }
+      const { data: updated } = await supabase
+        .from("users")
+        .update({ nickname: nick, gender, table_no: tableNo, last_seen: new Date().toISOString() })
+        .eq("id", existing.id)
+        .select("id, nickname, gender, avatar_seed, table_no")
+        .single();
+      return { ok: true as const, user: updated ?? existing };
+    }
   }
 
-  // 4. Anonymous sign-in → throwaway auth.uid(), no email/password
+  // 5. Anonymous sign-in → throwaway auth.uid(), no email/password
   const { data: auth, error: authErr } = await supabase.auth.signInAnonymously();
   if (authErr || !auth.user) {
     return { ok: false as const, error: "Could not start a session. Try again." };
   }
 
-  // 5. Create the patron row (RLS allows insert where auth_uid = auth.uid())
+  // 6. Create the patron row (RLS allows insert where auth_uid = auth.uid())
   const avatar_seed = crypto.randomUUID();
   const { data: user, error: insErr } = await supabase
     .from("users")
@@ -104,7 +152,7 @@ export async function joinBar(input: JoinInput) {
       nickname: nick,
       gender,
       avatar_seed,
-      table_no: table?.toString().slice(0, 10) || null,
+      table_no: tableNo,
     })
     .select("id, nickname, gender, avatar_seed, table_no")
     .single();
@@ -116,16 +164,16 @@ export async function joinBar(input: JoinInput) {
   return { ok: true as const, user };
 }
 
-// Resolve the caller's users.id from their session.
-async function currentUserId(supabase: ReturnType<typeof getServerClient>) {
+// Resolve the caller's own row from their session.
+async function currentUser(supabase: ReturnType<typeof getServerClient>) {
   const { data: auth } = await supabase.auth.getUser();
   if (!auth.user) return null;
   const { data } = await supabase
     .from("users")
-    .select("id")
+    .select("id, nickname, bar_id")
     .eq("auth_uid", auth.user.id)
-    .single();
-  return data?.id ?? null;
+    .maybeSingle();
+  return data ?? null;
 }
 
 // ---- Send a chat message (profanity filtered server-side) ------------------
@@ -134,8 +182,12 @@ export async function sendMessage(matchId: string, body: string) {
   if (!text) return { ok: false as const, error: "Empty message." };
   if (text.length > 500) return { ok: false as const, error: "Message too long." };
 
+  if (!rateLimit(clientKey("msg"), 30, 10_000)) {
+    return { ok: false as const, error: "Slow down a little." };
+  }
+
   const supabase = getServerClient();
-  const me = await currentUserId(supabase);
+  const me = await currentUser(supabase);
   if (!me) return { ok: false as const, error: "Session expired. Please rejoin." };
 
   // mask offensive words before storing — bypass-proof because it's server-side
@@ -143,7 +195,7 @@ export async function sendMessage(matchId: string, body: string) {
 
   const { error } = await supabase.from("messages").insert({
     match_id: matchId,
-    sender: me,
+    sender: me.id,
     body: clean,
   });
   // RLS guarantees you can only post into a match you belong to
@@ -152,20 +204,72 @@ export async function sendMessage(matchId: string, body: string) {
   return { ok: true as const, flagged };
 }
 
+// ---- Send a drink to another patron ---------------------------------------
+// Runs server-side so the sender's nickname, the recipient and the table number
+// come from the database instead of the browser (they used to be client input,
+// which meant anyone could post fake orders to any bar's staff screen).
+export async function orderDrink(targetUserId: string, drink: string) {
+  if (!rateLimit(clientKey("drink"), 10, 60_000)) {
+    return { ok: false as const, error: "Too many orders. Please wait a minute." };
+  }
+  if (!(DRINKS as readonly string[]).includes(drink)) {
+    return { ok: false as const, error: "Unknown drink." };
+  }
+
+  const supabase = getServerClient();
+  const me = await currentUser(supabase);
+  if (!me) return { ok: false as const, error: "Session expired. Please rejoin." };
+  if (me.id === targetUserId) return { ok: false as const, error: "Pick someone else." };
+
+  const service = serviceClient();
+  const { data: target } = await service
+    .from("users")
+    .select("id, nickname, table_no, bar_id, is_banned")
+    .eq("id", targetUserId)
+    .maybeSingle();
+
+  if (!target || target.is_banned || target.bar_id !== me.bar_id) {
+    return { ok: false as const, error: "That person is no longer in the bar." };
+  }
+
+  // drink_orders has no client-facing RLS policy: the service role is the only
+  // way in, so every row here went through these checks.
+  const { error } = await service.from("drink_orders").insert({
+    bar_id: me.bar_id,
+    from_nick: me.nickname,
+    to_nick: target.nickname,
+    to_table: target.table_no ?? null,
+    drink,
+  });
+  if (error) return { ok: false as const, error: "Could not send the drink. Try again." };
+
+  return { ok: true as const };
+}
+
 // ---- Block / Report a user -------------------------------------------------
 export async function reportUser(reportedUserId: string, reason?: string) {
-  const supabase = getServerClient();
-  const me = await currentUserId(supabase);
-  if (!me) return { ok: false as const, error: "Session expired." };
+  if (!rateLimit(clientKey("report"), 10, 60_000)) {
+    return { ok: false as const, error: "Too many reports. Please wait a minute." };
+  }
 
-  const { error } = await supabase.from("reports").insert({
-    reporter: me,
-    reported: reportedUserId,
-    reason: reason ?? null,
-  });
+  const supabase = getServerClient();
+  const me = await currentUser(supabase);
+  if (!me) return { ok: false as const, error: "Session expired." };
+  if (me.id === reportedUserId) return { ok: false as const, error: "You can't report yourself." };
+
+  // One report per pair: re-reporting the same person is a no-op instead of an
+  // error, so nobody can stack three reports alone and auto-ban someone.
+  const { error } = await supabase.from("reports").upsert(
+    {
+      reporter: me.id,
+      reported: reportedUserId,
+      reason: reason ?? null,
+    },
+    { onConflict: "reporter,reported", ignoreDuplicates: true }
+  );
   if (error) return { ok: false as const, error: "Could not submit report." };
 
-  // 3 reports auto-bans the user (handled by DB trigger). We also tell the
-  // client so it can hide the conversation immediately.
+  // 3 reports from 3 DIFFERENT people auto-bans the user (DB trigger). We also
+  // tell the client so it can hide the conversation immediately.
   return { ok: true as const };
 }

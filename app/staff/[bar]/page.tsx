@@ -1,19 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useParams } from "next/navigation";
-import { supabase } from "@/lib/supabase/client";
-import { staffLogin, staffAuthed, serveOrder } from "../actions";
-
-type Order = {
-  id: string;
-  from_nick: string;
-  to_nick: string | null;
-  to_table: string | null;
-  drink: string;
-  status: string;
-  created_at: string;
-};
+import { staffLogin, staffAuthed, serveOrder, listOrders, type Order } from "../actions";
 
 export default function StaffPage() {
   const { bar } = useParams<{ bar: string }>();
@@ -23,50 +12,40 @@ export default function StaffPage() {
   const [orders, setOrders] = useState<Order[]>([]);
 
   useEffect(() => {
-    staffAuthed().then((r) => setAuthed(r.authed));
-  }, []);
+    staffAuthed(bar).then((r) => setAuthed(r.authed));
+  }, [bar]);
 
-  // load + subscribe to pending orders for this bar
+  const load = useCallback(async () => {
+    const r = await listOrders(bar);
+    if (r.ok) setOrders(r.orders);
+    else if (r.error === "Not authorized.") setAuthed(false);
+  }, [bar]);
+
+  // Poll through the server action. Subscribing from the browser would require
+  // drink_orders to be world-readable, which leaked every venue's orders.
   useEffect(() => {
     if (!authed) return;
-    let active = true;
-
-    async function load() {
-      const { data } = await supabase
-        .from("drink_orders")
-        .select("*")
-        .eq("bar_id", bar)
-        .eq("status", "pending")
-        .order("created_at", { ascending: true });
-      if (active) setOrders((data as Order[]) ?? []);
-    }
     load();
-
-    const channel = supabase
-      .channel(`drinks:${bar}`)
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "drink_orders", filter: `bar_id=eq.${bar}` },
-        () => load()
-      )
-      .subscribe();
-    return () => {
-      active = false;
-      channel.unsubscribe();
-    };
-  }, [authed, bar]);
+    const timer = setInterval(load, 3000);
+    return () => clearInterval(timer);
+  }, [authed, load]);
 
   async function handleLogin(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-    const r = await staffLogin(password);
+    const r = await staffLogin(bar, password);
     if (!r.ok) return setError(r.error);
+    setPassword("");
     setAuthed(true);
   }
 
   async function markServed(id: string) {
     setOrders((prev) => prev.filter((o) => o.id !== id)); // optimistic
-    await serveOrder(id);
+    const r = await serveOrder(bar, id);
+    if (!r.ok) {
+      setError(r.error);
+      load(); // put it back if the server refused
+    }
   }
 
   if (authed === false) {
@@ -74,6 +53,7 @@ export default function StaffPage() {
       <main className="min-h-dvh bg-black text-white flex items-center justify-center px-6">
         <form onSubmit={handleLogin} className="w-full max-w-xs space-y-4">
           <h1 className="text-2xl font-black text-center">Staff 🍹</h1>
+          <p className="text-center text-xs text-white/40">ร้าน: {bar}</p>
           <input
             type="password"
             value={password}
@@ -98,6 +78,8 @@ export default function StaffPage() {
         <h1 className="text-2xl font-black">ออเดอร์เครื่องดื่ม 🍹</h1>
         <span className="text-sm text-white/50">{orders.length} รอเสิร์ฟ</span>
       </header>
+
+      {error && <p className="text-sm text-rose-400 mb-3">{error}</p>}
 
       {orders.length === 0 && (
         <p className="text-center text-white/40 mt-20">ยังไม่มีออเดอร์ — หน้าจอนี้จะเด้งเองเมื่อมีคนสั่ง</p>

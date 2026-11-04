@@ -1,35 +1,32 @@
 "use server";
 
-import { createClient } from "@supabase/supabase-js";
 import { cookies } from "next/headers";
+import { serviceClient } from "@/lib/supabase/service";
+import { sessionToken, safeEqual } from "@/lib/authCookie";
+import { rateLimit, clientKey } from "@/lib/rateLimit";
 
 const ADMIN_COOKIE = "admin_session";
-
-// Service-role client: bypasses RLS so admin can write to `bars`.
-// SUPABASE_SERVICE_ROLE_KEY is server-only (NOT prefixed NEXT_PUBLIC) — never
-// exposed to the browser.
-function adminClient() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
-}
+const ADMIN_SCOPE = "admin";
 
 function isAuthed() {
-  const secret = process.env.ADMIN_PASSWORD;
-  return !!secret && cookies().get(ADMIN_COOKIE)?.value === secret;
+  if (!process.env.ADMIN_PASSWORD) return false;
+  return safeEqual(cookies().get(ADMIN_COOKIE)?.value, sessionToken(ADMIN_SCOPE));
 }
 
 // ---- Login -----------------------------------------------------------------
 export async function adminLogin(password: string) {
-  if (!process.env.ADMIN_PASSWORD) {
+  if (!rateLimit(clientKey("admin-login"), 5, 60_000)) {
+    return { ok: false as const, error: "Too many attempts. Please wait a minute." };
+  }
+  const expected = process.env.ADMIN_PASSWORD;
+  if (!expected) {
     return { ok: false as const, error: "ADMIN_PASSWORD is not set on the server." };
   }
-  if (password !== process.env.ADMIN_PASSWORD) {
+  if (!safeEqual(password, expected)) {
     return { ok: false as const, error: "Wrong password." };
   }
-  cookies().set(ADMIN_COOKIE, password, {
+  // The cookie holds a signed token, never the password itself.
+  cookies().set(ADMIN_COOKIE, sessionToken(ADMIN_SCOPE), {
     httpOnly: true,
     sameSite: "lax",
     secure: process.env.NODE_ENV === "production",
@@ -58,13 +55,14 @@ export type Bar = {
   menu_url?: string | null;
   active?: boolean;
   expires_at?: string | null;
+  staff_password?: string | null;
 };
 
 export async function listBars() {
   if (!isAuthed()) return { ok: false as const, error: "Not authorized." };
-  const { data, error } = await adminClient()
+  const { data, error } = await serviceClient()
     .from("bars")
-    .select("id, name, lat, lng, radius_meters, menu_url, active, expires_at")
+    .select("id, name, lat, lng, radius_meters, menu_url, active, expires_at, staff_password")
     .order("created_at", { ascending: true });
   if (error) return { ok: false as const, error: error.message };
   return { ok: true as const, bars: (data ?? []) as Bar[] };
@@ -76,12 +74,22 @@ export async function saveBar(bar: Bar) {
   const id = bar.id.trim().toLowerCase().replace(/[^a-z0-9-]/g, "");
   if (id.length < 2) return { ok: false as const, error: "Bar ID must be at least 2 characters (a-z, 0-9, -)." };
   if (!bar.name.trim()) return { ok: false as const, error: "Bar name is required." };
-  if (Number.isNaN(bar.lat) || Number.isNaN(bar.lng)) {
+  if (!Number.isFinite(bar.lat) || !Number.isFinite(bar.lng)) {
     return { ok: false as const, error: "Please drop a pin on the map." };
   }
   const radius = Math.max(20, Math.min(2000, Math.round(bar.radius_meters)));
 
-  const { error } = await adminClient()
+  const expiresAt = bar.expires_at || null;
+  if (expiresAt && Number.isNaN(new Date(expiresAt).getTime())) {
+    return { ok: false as const, error: "Invalid expiry date." };
+  }
+
+  const staffPassword = bar.staff_password?.trim() || null;
+  if (staffPassword && staffPassword.length < 4) {
+    return { ok: false as const, error: "Staff password must be at least 4 characters." };
+  }
+
+  const { error } = await serviceClient()
     .from("bars")
     .upsert(
       {
@@ -92,7 +100,8 @@ export async function saveBar(bar: Bar) {
         radius_meters: radius,
         menu_url: bar.menu_url?.trim() || null,
         active: bar.active ?? true,
-        expires_at: bar.expires_at || null,
+        expires_at: expiresAt,
+        staff_password: staffPassword,
       },
       { onConflict: "id" }
     );
@@ -102,7 +111,7 @@ export async function saveBar(bar: Bar) {
 
 export async function deleteBar(id: string) {
   if (!isAuthed()) return { ok: false as const, error: "Not authorized." };
-  const { error } = await adminClient().from("bars").delete().eq("id", id);
+  const { error } = await serviceClient().from("bars").delete().eq("id", id);
   if (error) return { ok: false as const, error: error.message };
   return { ok: true as const };
 }
@@ -111,7 +120,7 @@ export async function deleteBar(id: string) {
 // Uses Places API (New). GOOGLE_MAPS_API_KEY is server-only.
 export type PlaceHit = { placeId: string; text: string };
 
-export async function searchPlaces(query: string, sessionToken: string) {
+export async function searchPlaces(query: string, sessionTokenValue: string) {
   if (!isAuthed()) return { ok: false as const, error: "Not authorized." };
   const key = process.env.GOOGLE_MAPS_API_KEY;
   if (!key) return { ok: false as const, error: "GOOGLE_MAPS_API_KEY is not set on the server." };
@@ -122,7 +131,7 @@ export async function searchPlaces(query: string, sessionToken: string) {
     headers: { "Content-Type": "application/json", "X-Goog-Api-Key": key },
     body: JSON.stringify({
       input: query,
-      sessionToken,
+      sessionToken: sessionTokenValue,
       languageCode: "th",
       regionCode: "TH",
     }),
@@ -136,13 +145,13 @@ export async function searchPlaces(query: string, sessionToken: string) {
   return { ok: true as const, results };
 }
 
-export async function placeLocation(placeId: string, sessionToken: string) {
+export async function placeLocation(placeId: string, sessionTokenValue: string) {
   if (!isAuthed()) return { ok: false as const, error: "Not authorized." };
   const key = process.env.GOOGLE_MAPS_API_KEY;
   if (!key) return { ok: false as const, error: "GOOGLE_MAPS_API_KEY is not set on the server." };
 
   const res = await fetch(
-    `https://places.googleapis.com/v1/places/${placeId}?sessionToken=${encodeURIComponent(sessionToken)}`,
+    `https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}?sessionToken=${encodeURIComponent(sessionTokenValue)}`,
     { headers: { "X-Goog-Api-Key": key, "X-Goog-FieldMask": "location,displayName" } }
   );
   const data = await res.json();

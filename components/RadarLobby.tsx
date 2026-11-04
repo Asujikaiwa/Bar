@@ -1,8 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { supabase, avatarUrl, DRINKS, type Patron } from "@/lib/supabase/client";
+import { supabase } from "@/lib/supabase/client";
+import { avatarUrl, DRINKS, type Patron } from "@/lib/constants";
+import { orderDrink } from "@/app/actions";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 
 const GENDER_COLOR: Record<string, string> = {
@@ -20,40 +22,80 @@ export default function RadarLobby({ me, barId }: { me: Patron; barId: string })
   const [match, setMatch] = useState<{ matchId: string; nickname: string } | null>(null);
   const [drinkFor, setDrinkFor] = useState<Patron | null>(null);
   const channelRef = useRef<RealtimeChannel | null>(null);
+  // Read by the realtime handlers without making them a subscription dependency.
+  const patronsRef = useRef<Patron[]>([]);
+  patronsRef.current = patrons;
+
+  const showToast = useCallback((text: string, ms = 3500) => {
+    setToast(text);
+    setTimeout(() => setToast((current) => (current === text ? null : current)), ms);
+  }, []);
 
   // ---- Presence: who's currently in the bar -------------------------------
+  // Presence payloads come from the browser, so they can be forged. We only
+  // take the user ids from presence and read the profiles back from the
+  // database (RLS scopes that to this bar), which makes the nickname/gender on
+  // screen the server's version rather than whatever the client claimed.
   useEffect(() => {
     const channel = supabase.channel(`bar:${barId}`, {
       config: { presence: { key: me.user_id } },
     });
     channelRef.current = channel;
+    let active = true;
+
+    async function syncPresence() {
+      const state = channel.presenceState();
+      const ids = Object.keys(state).filter((id) => id !== me.user_id);
+      if (ids.length === 0) {
+        if (active) setPatrons([]);
+        return;
+      }
+      const { data } = await supabase
+        .from("users")
+        .select("id, nickname, gender, avatar_seed, table_no")
+        .in("id", ids)
+        .eq("is_banned", false);
+      if (!active) return;
+      setPatrons(
+        (data ?? []).map((u: any) => ({
+          user_id: u.id,
+          nickname: u.nickname,
+          gender: u.gender,
+          avatar_seed: u.avatar_seed,
+          table_no: u.table_no,
+        }))
+      );
+    }
 
     channel
       .on("presence", { event: "sync" }, () => {
-        const state = channel.presenceState<Patron>();
-        const list = Object.values(state)
-          .map((entries) => entries[0])
-          .filter((p) => p && p.user_id !== me.user_id);
-        setPatrons(list);
+        syncPresence();
       })
       .subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
-          await channel.track(me); // announce myself
+          await channel.track({ user_id: me.user_id }); // announce myself
         }
       });
 
     return () => {
+      active = false;
       channel.unsubscribe();
     };
-  }, [barId, me]);
+  }, [barId, me.user_id]);
 
   // ---- Cheers / Match notifications ---------------------------------------
   // RLS already limits these rows to ones I'm part of, so no extra filter needed.
+  // Depends on my id only: keying this on `patrons` used to tear the channel
+  // down and rebuild it every time somebody walked in or out, and any Cheers
+  // that arrived during the gap was lost.
   useEffect(() => {
+    function nicknameOf(id: string) {
+      return patronsRef.current.find((p) => p.user_id === id)?.nickname;
+    }
+
     function onMatched(m: { id: string; requester: string; target: string }) {
       const otherId = m.requester === me.user_id ? m.target : m.requester;
-      const other = patrons.find((p) => p.user_id === otherId);
-      setMatch({ matchId: m.id, nickname: other?.nickname ?? "your match" });
+      setMatch({ matchId: m.id, nickname: nicknameOf(otherId) ?? "your match" });
     }
 
     const sub = supabase
@@ -65,9 +107,7 @@ export default function RadarLobby({ me, barId }: { me: Patron; barId: string })
         (payload) => {
           const m = payload.new as { requester: string; status: string };
           if (m.status === "matched") return; // handled below
-          const from = patrons.find((p) => p.user_id === m.requester);
-          setToast(`${from?.nickname ?? "Someone"} sent you a Cheers 🍻 — cheers back to match!`);
-          setTimeout(() => setToast(null), 5000);
+          showToast(`${nicknameOf(m.requester) ?? "Someone"} sent you a Cheers 🍻 — cheers back to match!`, 5000);
         }
       )
       // my earlier cheers got reciprocated (row flipped to matched)
@@ -92,7 +132,7 @@ export default function RadarLobby({ me, barId }: { me: Patron; barId: string })
     return () => {
       sub.unsubscribe();
     };
-  }, [me.user_id, patrons]);
+  }, [me.user_id, showToast]);
 
   async function sendCheers(target: Patron) {
     if (cheered.has(target.user_id)) return;
@@ -105,34 +145,30 @@ export default function RadarLobby({ me, barId }: { me: Patron; barId: string })
     });
     // If the reciprocal cheers existed, the DB trigger flips this to "matched"
     // and our realtime subscription pops the "It's a Match!" overlay.
-    if (error) {
+    if (error && error.code !== "23505") {
+      // 23505 = already cheered this person; that's not a failure worth shouting about
       setCheered((s) => {
         const n = new Set(s);
         n.delete(target.user_id);
         return n;
       });
-      setToast("Couldn't send cheers. Try again.");
+      showToast("Couldn't send cheers. Try again.");
     } else {
-      setToast(`Cheers sent to ${target.nickname} 🍻`);
+      showToast(`Cheers sent to ${target.nickname} 🍻`);
     }
-    setTimeout(() => setToast(null), 3500);
   }
 
   async function sendDrink(target: Patron, drink: string) {
     setDrinkFor(null);
-    const { error } = await supabase.from("drink_orders").insert({
-      bar_id: barId,
-      from_nick: me.nickname,
-      to_nick: target.nickname,
-      to_table: target.table_no ?? null,
-      drink,
-    });
-    setToast(
-      error
-        ? "ส่งเครื่องดื่มไม่สำเร็จ ลองใหม่"
-        : `ส่ง ${drink} ให้ ${target.nickname} แล้ว! พนักงานกำลังนำไปเสิร์ฟ 🍹`
+    // Server action: it looks up the recipient and fills in the sender's own
+    // nickname, so the order can't be forged or aimed at another venue.
+    const res = await orderDrink(target.user_id, drink);
+    showToast(
+      res.ok
+        ? `ส่ง ${drink} ให้ ${target.nickname} แล้ว! พนักงานกำลังนำไปเสิร์ฟ 🍹`
+        : res.error,
+      4000
     );
-    setTimeout(() => setToast(null), 4000);
   }
 
   return (

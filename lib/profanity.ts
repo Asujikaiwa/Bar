@@ -9,8 +9,18 @@ const BLOCKLIST = [
   "fuck", "shit", "bitch", "asshole", "bastard", "cunt", "dick", "slut", "whore",
   "nigger", "faggot", "retard",
   // Thai (คำหยาบทั่วไป)
-  "เหี้ย", "สัส", "ส้นตีน", "ควย", "หี", "เย็ด", "แม่ง", "มึง", "กู", "ไอ้สัตว์",
+  "เหี้ย", "สัส", "ส้นตีน", "ควย", "เย็ด", "แม่ง", "ไอ้สัตว์",
   "เงี่ยน", "ดอกทอง", "กระหรี่", "พ่อง", "ระยำ", "ชาติชั่ว",
+];
+
+// Short Thai words that are substrings of perfectly normal words. Thai has no
+// word boundaries, so each one carries the continuations it must NOT match
+// (กู+เกิล = Google, หี+บ = a chest, ...). When a false positive turns up, add
+// the continuation here instead of dropping the word from the filter.
+const AMBIGUOUS: { word: string; notFollowedBy: string[] }[] = [
+  { word: "กู", notFollowedBy: ["เกิล", "เกิ้ล", "รู", "ร์", "ด"] },
+  { word: "หี", notFollowedBy: ["บ", "ด", "น"] },
+  { word: "มึง", notFollowedBy: [] },
 ];
 
 // normalize: lowercase, strip spaces/dots between letters that evade filters
@@ -24,12 +34,22 @@ function normalize(text: string) {
     .replace(/\$/g, "s");
 }
 
-export function containsProfanity(text: string): boolean {
-  const norm = normalize(text);
-  return BLOCKLIST.some((w) => norm.includes(normalize(w)));
+function escapeRe(source: string) {
+  return source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// Mask offending words with asterisks while keeping the rest of the message.
+export function containsProfanity(text: string): boolean {
+  const norm = normalize(text);
+  if (BLOCKLIST.some((w) => norm.includes(normalize(w)))) return true;
+  return AMBIGUOUS.some(({ word, notFollowedBy }) => {
+    const tail = notFollowedBy.length
+      ? `(?!${notFollowedBy.map((s) => escapeRe(normalize(s))).join("|")})`
+      : "";
+    return new RegExp(`${escapeRe(normalize(word))}${tail}`).test(norm);
+  });
+}
+
+// Mask offending words with dots while keeping the rest of the message.
 export function maskProfanity(text: string): { clean: string; flagged: boolean } {
   let flagged = false;
   const clean = text

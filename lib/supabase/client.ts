@@ -1,41 +1,34 @@
 "use client";
 
 import { createBrowserClient } from "@supabase/ssr";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
-// Browser Supabase client. Uses anon key — RLS enforces all access rules.
-export const supabase = createBrowserClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
+// The client is created lazily. A module-scope client would run during the
+// build (page-data collection / prerender) where the env vars may be absent,
+// and that crashes the whole page instead of just failing at runtime.
+let cached: SupabaseClient | null = null;
 
-// Deterministic anonymous avatar from a seed (no real photos).
-// Uses DiceBear (open-source) — swap for any avatar service you like.
-export function avatarUrl(seed: string) {
-  return `https://api.dicebear.com/9.x/thumbs/svg?seed=${encodeURIComponent(seed)}`;
+function getClient(): SupabaseClient {
+  if (cached) return cached;
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (!url || !key) {
+    throw new Error(
+      "NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY are not set."
+    );
+  }
+  cached = createBrowserClient(url, key);
+  return cached;
 }
 
-export const GENDERS = [
-  { value: "male", label: "Male", glow: "shadow-[0_0_18px] shadow-cyan-500/60", ring: "ring-cyan-400" },
-  { value: "female", label: "Female", glow: "shadow-[0_0_18px] shadow-pink-500/60", ring: "ring-pink-400" },
-  { value: "lgbtq", label: "LGBTQ+", glow: "shadow-[0_0_18px] shadow-fuchsia-500/60", ring: "ring-fuchsia-400" },
-] as const;
+// Uses the anon key — RLS enforces all access rules.
+export const supabase = new Proxy({} as SupabaseClient, {
+  get(_target, prop) {
+    const client = getClient() as unknown as Record<string | symbol, unknown>;
+    const value = client[prop];
+    return typeof value === "function" ? value.bind(client) : value;
+  },
+});
 
-export type Gender = (typeof GENDERS)[number]["value"];
-
-export type Patron = {
-  user_id: string;
-  nickname: string;
-  gender: Gender;
-  avatar_seed: string;
-  table_no?: string | null;
-};
-
-// Drink menu for the "send a drink 🍹" feature
-export const DRINKS = [
-  "เบียร์ 🍺",
-  "ค็อกเทล 🍸",
-  "ช็อต 🥃",
-  "ไวน์ 🍷",
-  "แชมเปญ 🥂",
-  "น้ำผลไม้ 🧃",
-] as const;
+export { avatarUrl, GENDERS, DRINKS } from "@/lib/constants";
+export type { Gender, Patron } from "@/lib/constants";

@@ -23,6 +23,7 @@ const BLANK: Bar = {
   menu_url: "",
   active: true,
   expires_at: null,
+  staff_password: "",
 };
 
 function cryptoRandom() {
@@ -336,6 +337,17 @@ export default function AdminPage() {
           value={editing.menu_url ?? ""}
           onChange={(e) => setEditing((p) => ({ ...p, menu_url: e.target.value }))}
           placeholder="https://lin.ee/... หรือลิงก์ระบบสั่งอาหารของร้าน"
+          className="w-full rounded-lg bg-black/40 border border-white/10 px-3 py-2 outline-none focus:border-cyan-400 mb-4"
+        />
+
+        {/* per-bar staff password */}
+        <label className="block text-xs text-white/50 mb-1">
+          รหัสผ่านจอพนักงานของร้านนี้ (เว้นว่าง = ใช้ STAFF_PASSWORD ตัวกลาง)
+        </label>
+        <input
+          value={editing.staff_password ?? ""}
+          onChange={(e) => setEditing((p) => ({ ...p, staff_password: e.target.value }))}
+          placeholder="ตั้งรหัสแยกให้แต่ละร้าน เพื่อไม่ให้พนักงานข้ามร้านกันได้"
           className="w-full rounded-lg bg-black/40 border border-white/10 px-3 py-2 outline-none focus:border-cyan-400 mb-4"
         />
 

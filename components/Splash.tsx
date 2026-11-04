@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 /**
  * หน้าโหลดตอนเข้า — โชว์โลโก้นีออน หมุน/เรืองแสง แล้ว "วาป" (ซูม+เฟด) หายไป
@@ -8,10 +8,20 @@ import { useEffect, useState } from "react";
  */
 export default function Splash({ onDone }: { onDone: () => void }) {
   const [leaving, setLeaving] = useState(false);
+  // Kept in a ref so an inline onDone prop doesn't restart the timers on every
+  // re-render of the parent.
+  const doneRef = useRef(onDone);
+  doneRef.current = onDone;
 
   useEffect(() => {
     const hold = setTimeout(() => setLeaving(true), 1500); // โชว์ ~1.5 วิ
-    return () => clearTimeout(hold);
+    // Safety net: if the browser never fires transitionend (tab in the
+    // background, reduced motion, …) the splash would cover the app forever.
+    const bail = setTimeout(() => doneRef.current(), 3000);
+    return () => {
+      clearTimeout(hold);
+      clearTimeout(bail);
+    };
   }, []);
 
   return (
